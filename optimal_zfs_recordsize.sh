@@ -1,19 +1,17 @@
 #!/bin/bash
 
 # A script to generate a file size histogram and provide an intelligent ZFS recordsize recommendation.
-# VERSION 4.3: Added a green-yellow-red gradient to histogram bars.
 
 # --- Script Setup and Validation ---
 set -e
 set -o pipefail
 
-# Check for gawk, which is required for its advanced features
+# Check for gawk
 command -v gawk >/dev/null 2>&1 || {
     echo "Error: 'gawk' (GNU Awk) is required but not found. Please install it." >&2
     exit 1
 }
 
-# Check for a single argument: the directory to analyze
 if [ "$#" -ne 1 ]; then
     echo "Usage: $0 <path_to_directory>"
     exit 1
@@ -21,7 +19,6 @@ fi
 
 TARGET_DIR="$1"
 
-# Check if the target is a valid directory
 if [ ! -d "$TARGET_DIR" ]; then
     echo "Error: '$TARGET_DIR' is not a valid directory." >&2
     exit 1
