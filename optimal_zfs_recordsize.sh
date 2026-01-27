@@ -25,12 +25,74 @@ if [ ! -d "$TARGET_DIR" ]; then
 fi
 
 echo "Analyzing file sizes in: $TARGET_DIR"
-echo "This may take a while for large directories..."
 echo ""
+
+# Estimate maximum possible number of files by reading no of inodes
+# on underlying datastore which we will replace later once known.
+
+TOTAL_FILES=$(/usr/bin/df --output=iused $TARGET_DIR|tail -1)
+printf "Maximum estimated files: %d\n" "$TOTAL_FILES" >&2
+
+# Start background file count
+TMP_TOTAL=$(mktemp /tmp/tmp.zfs_rs_total.XXXXXX)
+trap 'rm -f "$TMP_TOTAL"' EXIT
+(
+   /usr/bin/find -O3 $TARGET_DIR|wc -l
+) > $TMP_TOTAL &
+COUNT_PID=$!
 
 # --- Main Logic via find and gawk ---
 # The AWK script is passed as a command-line argument.
-/usr/bin/find "$TARGET_DIR" -type f -printf "%s\n" | /usr/bin/gawk '
+
+(
+    COUNT=0
+    BAR_WIDTH=40
+    TOTAL_KNOWN=0
+    UPDATE_EVERY=727 # Increase this prime number if dealing with huge numbers of files
+
+    /usr/bin/find -O3 "$TARGET_DIR" -type f -printf "%s\n" | while read -r size; do
+        COUNT=$((COUNT + 1))
+
+        if [[ $TOTAL_KNOWN -eq 0 && -s $TMP_TOTAL ]]; then
+            TOTAL_FILES=$(cat "$TMP_TOTAL")
+            TOTAL_KNOWN=1
+            printf "\r      Total files found: %d\n" "$TOTAL_FILES" >&2
+        fi
+
+        # Update progress only occasionally
+        if (( TOTAL_KNOWN == 1 && COUNT % UPDATE_EVERY == 0 )); then
+            PERCENT=$(( COUNT * 100 / TOTAL_FILES ))
+
+            FILLED=$(( PERCENT * BAR_WIDTH / 100 ))
+            EMPTY=$(( BAR_WIDTH - FILLED ))
+
+            printf "\r|%-*s%*s|%3d%%  Processed: %d files" \
+                "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
+                "$EMPTY" "" \
+                "$PERCENT" \
+                "$COUNT" >&2
+        fi
+    echo "$size"
+    done
+
+    TOTAL_FILES=$(cat $TMP_TOTAL)
+    COUNT=$TOTAL_FILES
+    PERCENT=$(( COUNT * 100 / TOTAL_FILES ))
+    FILLED=$(( PERCENT * BAR_WIDTH / 100 ))
+    EMPTY=$(( BAR_WIDTH - FILLED ))
+
+    printf "\n\n\n\n\n" # To clean final output in case of noisy terminal
+    printf "\r|%-*s%*s|%3d%%  Processed: %d files" \
+        "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
+        "$EMPTY" "" \
+        "$PERCENT" \
+        "$COUNT" >&2
+
+    printf "\n\nProcessing complete! Generating report...\n\n" >&2
+
+    rm -f $TMP_TOTAL
+) | /usr/bin/gawk '
+
 # --- AWK BEGIN Block: Initialization ---
 BEGIN {
     # Define the file size bins (powers of 2)
