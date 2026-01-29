@@ -6,6 +6,12 @@
 set -e
 set -o pipefail
 
+cleanup() {
+    rm -f "$TMP_TOTAL"
+}
+
+TMP_TOTAL=$(mktemp /tmp/tmp.optimal_zfs_recordsize-total.XXXXXX)
+
 # Check for gawk
 command -v gawk >/dev/null 2>&1 || {
     echo "Error: 'gawk' (GNU Awk) is required but not found. Please install it." >&2
@@ -24,73 +30,59 @@ if [ ! -d "$TARGET_DIR" ]; then
     exit 1
 fi
 
-echo "Analyzing file sizes in: $TARGET_DIR"
+echo "Analyzing files in: $TARGET_DIR"
 echo ""
 
 # Estimate maximum possible number of files by reading no of inodes
-# on underlying datastore which we will replace later once known.
+# on underlying datastore which is hyper-conservative so we will tell user.
 
-TOTAL_FILES=$(/usr/bin/df --output=iused $TARGET_DIR|tail -1)
-printf "Maximum estimated files: %d\n" "$TOTAL_FILES" >&2
-
-# Start background file count
-TMP_TOTAL=$(mktemp /tmp/tmp.zfs_rs_total.XXXXXX)
-trap 'rm -f "$TMP_TOTAL"' EXIT
-(
-   /usr/bin/find -O3 $TARGET_DIR|wc -l
-) > $TMP_TOTAL &
-COUNT_PID=$!
+TOTAL_ESTIMATE=$(/usr/bin/df --output=iused $TARGET_DIR|tail -1)
 
 # --- Main Logic via find and gawk ---
 # The AWK script is passed as a command-line argument.
-
 (
-    COUNT=0
-    BAR_WIDTH=40
-    TOTAL_KNOWN=0
+    FILE_COUNT=0
+    BAR_WIDTH=48
     UPDATE_EVERY=727 # Increase this prime number if dealing with huge numbers of files
 
+    printf "Assume analyzing entire dataset of %d inodes.\n" "$TOTAL_ESTIMATE" >&2
+    printf "(If analyzing a subdir of dataset, estimate will be conservative!)\n\n" >&2
+
     /usr/bin/find -O3 "$TARGET_DIR" -type f -printf "%s\n" | while read -r size; do
-        COUNT=$((COUNT + 1))
+        FILE_COUNT=$((FILE_COUNT + 1))
+        if (( FILE_COUNT % UPDATE_EVERY == 0 )); then
+            PERCENT=$(( FILE_COUNT * 100 / TOTAL_ESTIMATE ))
 
-        if [[ $TOTAL_KNOWN -eq 0 && -s $TMP_TOTAL ]]; then
-            TOTAL_FILES=$(cat "$TMP_TOTAL")
-            TOTAL_KNOWN=1
-            printf "\r      Total files found: %d\n" "$TOTAL_FILES" >&2
-        fi
+            printf "\r: %d" "$TOTAL_ESTIMATE" >&2
 
-        # Update progress only occasionally
-        if (( TOTAL_KNOWN == 1 && COUNT % UPDATE_EVERY == 0 )); then
-            PERCENT=$(( COUNT * 100 / TOTAL_FILES ))
-
+            # Update progress only occasionally
             FILLED=$(( PERCENT * BAR_WIDTH / 100 ))
             EMPTY=$(( BAR_WIDTH - FILLED ))
 
-            printf "\r|%-*s%*s|%3d%%  Processed: %d files" \
+            printf "\r|%-*s%*s|%3d%% Processed: %d   " \
                 "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
                 "$EMPTY" "" \
                 "$PERCENT" \
-                "$COUNT" >&2
+                "$FILE_COUNT" >&2
         fi
-    echo "$size"
+        echo "$size"
+        echo $FILE_COUNT > "$TMP_TOTAL"
     done
 
-    TOTAL_FILES=$(cat $TMP_TOTAL)
-    COUNT=$TOTAL_FILES
-    PERCENT=$(( COUNT * 100 / TOTAL_FILES ))
-    FILLED=$(( PERCENT * BAR_WIDTH / 100 ))
-    EMPTY=$(( BAR_WIDTH - FILLED ))
-
-    printf "\n\n\n\n\n" # To clean final output in case of noisy terminal
-    printf "\r|%-*s%*s|%3d%%  Processed: %d files" \
+    FILE_COUNT=$(cat $TMP_TOTAL)
+    PERCENT=100
+    FILLED=$BAR_WIDTH
+    EMPTY=0
+   
+    printf "\n\n\n\n" >2& # To clean final output in case of noisy terminal
+    printf "\r|%-*s%*s|%3d%% Total: %d         " \
         "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
         "$EMPTY" "" \
         "$PERCENT" \
-        "$COUNT" >&2
+        "$FILE_COUNT" >&2
 
-    printf "\n\nProcessing complete! Generating report...\n\n" >&2
+    printf "\n\nProcessing finshed! Generating report...\n\n" >&2; sleep 4
 
-    rm -f $TMP_TOTAL
 ) | /usr/bin/gawk '
 
 # --- AWK BEGIN Block: Initialization ---
@@ -300,7 +292,7 @@ END {
     else {
         suggested_size_bytes = bins[suggested_bin_index];
         print "  This is a SMALL/MEDIUM FILE WORKLOAD. ";
-	print "  Your data distribution is dominated by files in the " hr(suggested_size_bytes) " range.\n";
+        print "  Your data distribution is dominated by files in the " hr(suggested_size_bytes) " range.\n";
         print "  RECOMMENDATION: Match the recordsize to this dominant file size.";
         print "  This provides a good balance of performance and storage efficiency for";
         print "  your specific workload.";
@@ -310,3 +302,4 @@ END {
     print "NOTE: This is a suggestion. Always benchmark your specific workload.";
 }
 '
+trap cleanup EXIT   
