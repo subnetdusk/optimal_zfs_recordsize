@@ -6,12 +6,6 @@
 set -e
 set -o pipefail
 
-cleanup() {
-    rm -f "$TMP_TOTAL"
-}
-
-TMP_TOTAL=$(mktemp /tmp/tmp.optimal_zfs_recordsize-total.XXXXXX)
-
 # Check for gawk
 command -v gawk >/dev/null 2>&1 || {
     echo "Error: 'gawk' (GNU Awk) is required but not found. Please install it." >&2
@@ -65,23 +59,18 @@ TOTAL_ESTIMATE=$(/usr/bin/df --output=iused $TARGET_DIR|tail -1)
                 "$PERCENT" \
                 "$FILE_COUNT" >&2
         fi
-        echo "$size"
-        echo $FILE_COUNT > "$TMP_TOTAL"
+    echo "$size"
     done
 
-    FILE_COUNT=$(cat $TMP_TOTAL)
     PERCENT=100
     FILLED=$BAR_WIDTH
     EMPTY=0
    
-    printf "\n\n\n\n" >2& # To clean final output in case of noisy terminal
-    printf "\r|%-*s%*s|%3d%% Total: %d         " \
+    printf "\r|%-*s%*s|%3d%% DONE!               " \
         "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
         "$EMPTY" "" \
-        "$PERCENT" \
-        "$FILE_COUNT" >&2
+        "$PERCENT" >&2
 
-    printf "\n\nProcessing finshed! Generating report...\n\n" >&2; sleep 4
 
 ) | /usr/bin/gawk '
 
@@ -166,6 +155,9 @@ END {
         print "No files found in the specified directory.";
         exit;
     }
+
+    # Final progress output here to avoid subshell isolation to get total
+    printf "\n\nProcessed %s files! Generating report...\n\n", total_files;
 
     # --- 1. Detailed Statistics Table ---
     print "=======================================================";
@@ -302,4 +294,3 @@ END {
     print "NOTE: This is a suggestion. Always benchmark your specific workload.";
 }
 '
-trap cleanup EXIT   
