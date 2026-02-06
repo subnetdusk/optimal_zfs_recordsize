@@ -30,7 +30,7 @@ echo ""
 # Estimate maximum possible number of files by reading no of inodes
 # on underlying datastore which is hyper-conservative so we will tell user.
 
-TOTAL_ESTIMATE=$(/usr/bin/df --output=iused $"TARGET_DIR"|tail -1)
+TOTAL_ESTIMATE=$(/usr/bin/df --output=iused "$TARGET_DIR"|tail -1)
 
 # --- Main Logic via find and gawk ---
 # The AWK script is passed as a command-line argument.
