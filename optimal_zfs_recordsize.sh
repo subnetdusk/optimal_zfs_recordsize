@@ -29,8 +29,15 @@ echo ""
 
 # Estimate maximum possible number of files by reading no of inodes
 # on underlying datastore which is hyper-conservative so we will tell user.
+# If the filesystem has dynamic inode allocation (i.e. Btrfs)
+# than falls back on a pre-scan with find | wc -l 
 
-TOTAL_ESTIMATE=$(/usr/bin/df --output=iused "$TARGET_DIR"|tail -1)
+TOTAL_ESTIMATE=$(/usr/bin/df --output=iused "$TARGET_DIR" 2>/dev/null | tail -1)
+
+if (( TOTAL_ESTIMATE <= 0 )) 2>/dev/null; then
+    printf "Counting files (no inode estimate available)...\n" >&2
+    TOTAL_ESTIMATE=$(find "$TARGET_DIR" -type f | wc -l)
+fi
 
 # --- Main Logic via find and gawk ---
 # The AWK script is passed as a command-line argument.
