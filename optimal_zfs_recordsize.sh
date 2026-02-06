@@ -24,13 +24,54 @@ if [ ! -d "$TARGET_DIR" ]; then
     exit 1
 fi
 
-echo "Analyzing file sizes in: $TARGET_DIR"
-echo "This may take a while for large directories..."
+echo "Analyzing files in: $TARGET_DIR"
 echo ""
+
+# Estimate maximum possible number of files by reading no of inodes
+# on underlying datastore which is hyper-conservative so we will tell user.
+
+TOTAL_ESTIMATE=$(/usr/bin/df --output=iused $TARGET_DIR|tail -1)
 
 # --- Main Logic via find and gawk ---
 # The AWK script is passed as a command-line argument.
-/usr/bin/find "$TARGET_DIR" -type f -printf "%s\n" | /usr/bin/gawk '
+(
+    FILE_COUNT=0
+    BAR_WIDTH=48
+    UPDATE_EVERY=727 # Increase this prime number if dealing with huge numbers of files
+
+    printf "Assume analyzing entire dataset of %d inodes.\n" "$TOTAL_ESTIMATE" >&2
+    printf "(If analyzing a subdir of dataset, estimate will be conservative!)\n\n" >&2
+
+    /usr/bin/find -O3 "$TARGET_DIR" -type f -printf "%s\n" | while read -r size; do
+        FILE_COUNT=$((FILE_COUNT + 1))
+        if (( FILE_COUNT % UPDATE_EVERY == 0 )); then
+            PERCENT=$(( FILE_COUNT * 100 / TOTAL_ESTIMATE ))
+
+            # Update progress only occasionally
+            FILLED=$(( PERCENT * BAR_WIDTH / 100 ))
+            EMPTY=$(( BAR_WIDTH - FILLED ))
+
+            printf "\r|%-*s%*s|%3d%% Processed: %d   " \
+                "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
+                "$EMPTY" "" \
+                "$PERCENT" \
+                "$FILE_COUNT" >&2
+        fi
+    echo "$size"
+    done
+
+    PERCENT=100
+    FILLED=$BAR_WIDTH
+    EMPTY=0
+   
+    printf "\r|%-*s%*s|%3d%% DONE!               " \
+        "$FILLED" "$(printf '%*s' "$FILLED" | tr ' ' '|')" \
+        "$EMPTY" "" \
+        "$PERCENT" >&2
+
+
+) | /usr/bin/gawk '
+
 # --- AWK BEGIN Block: Initialization ---
 BEGIN {
     # Define the file size bins (powers of 2)
@@ -112,6 +153,9 @@ END {
         print "No files found in the specified directory.";
         exit;
     }
+
+    # Final progress output here to avoid subshell isolation to get total
+    printf "\n\nProcessed %s files! Generating report...\n\n", total_files;
 
     # --- 1. Detailed Statistics Table ---
     print "=======================================================";
@@ -238,7 +282,7 @@ END {
     else {
         suggested_size_bytes = bins[suggested_bin_index];
         print "  This is a SMALL/MEDIUM FILE WORKLOAD. ";
-	print "  Your data distribution is dominated by files in the " hr(suggested_size_bytes) " range.\n";
+        print "  Your data distribution is dominated by files in the " hr(suggested_size_bytes) " range.\n";
         print "  RECOMMENDATION: Match the recordsize to this dominant file size.";
         print "  This provides a good balance of performance and storage efficiency for";
         print "  your specific workload.";
