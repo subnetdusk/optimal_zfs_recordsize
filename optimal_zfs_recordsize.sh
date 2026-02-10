@@ -28,8 +28,8 @@ fi
 echo "Analyzing files in: $TARGET_DIR"
 echo ""
 
-# Estimate max files via inode count (conservative on ext4/XFS, exact on ZFS).
-# Falls back to find | wc -l on Btrfs where df reports iused=0.
+# Estimate max files via inode count.
+# Falls back to find | wc -l on filesystems where df reports iused=0 (Btrfs).
 TOTAL_ESTIMATE=$(/usr/bin/df --output=iused "$TARGET_DIR" 2>/dev/null | tail -1)
 
 if (( TOTAL_ESTIMATE <= 0 )) 2>/dev/null; then
@@ -183,9 +183,9 @@ END {
     printf "\r|%s|100%% DONE!               \n", bar > "/dev/stderr";
     fflush("/dev/stderr");
 
-    printf "\n\nProcessed %s files! Generating report...\n\n", total_files;
+    printf "\nProcessed %s files! Generating report...\n", total_files;
 
-    # --- 1. Visual Histograms ---
+    # --- 1. Side-by-side Visual Histograms ---
     max_s = large_size;
     max_c = large_count;
     for (i = 0; i < num_bins; i++) {
@@ -194,52 +194,61 @@ END {
     }
 
     bar_char = bar_block;
+    bw = 35; # bar width per side
 
-    print "Visual Histogram (by total size in each bin)";
+    printf "\nHistograms\n";
+    print DSEP;
+    printf "  %-15s  %-35s  %s\n", "", "by total size", "by file count";
     print DSEP;
     for (i = 0; i < num_bins; i++) {
-        if (counts[i] > 0) {
-            bar_len = (max_s > 0) ? (total_size[i] / max_s) * 50 : 0;
-            if (bar_len < 1) bar_len = 1;
-            bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-            pct = (max_s > 0) ? (total_size[i] / max_s) * 100 : 0;
-            color = C_RED;
-            if (pct > 66) color = C_GREEN;
-            else if (pct > 33) color = C_YELLOW;
-            printf "  %-15s |%s%s%s\n", format_bin_name(bins[i]), color, bar, C_RESET;
-        }
-    }
-    if (large_count > 0) {
-        bar_len = (max_s > 0) ? (large_size / max_s) * 50 : 0;
-        if (bar_len < 1) bar_len = 1;
-        bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-        printf "  %-15s |%s%s%s\n\n", "> " hr(bins[num_bins-1]), C_GREEN, bar, C_RESET;
-    } else { print "" }
+        # Left bar: by size
+        if (counts[i] > 0 && max_s > 0) {
+            bl = int((total_size[i] / max_s) * bw + 0.5);
+            if (bl < 1) bl = 1;
+            pct = (total_size[i] / max_s) * 100;
+            col = C_RED;
+            if (pct > 66) col = C_GREEN;
+            else if (pct > 33) col = C_YELLOW;
+        } else { bl = 0; col = ""; }
+        lbar = ""; for (b = 0; b < bl; b++) lbar = lbar bar_char;
+        lpad = ""; for (b = bl; b < bw; b++) lpad = lpad " ";
 
-    print "Visual Histogram (by number of files in each bin)";
-    print DSEP;
-    for (i = 0; i < num_bins; i++) {
-        if (counts[i] > 0) {
-            bar_len = (max_c > 0) ? (counts[i] / max_c) * 50 : 0;
-            if (bar_len < 1) bar_len = 1;
-            bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-            pct = (max_c > 0) ? (counts[i] / max_c) * 100 : 0;
-            color = C_RED;
-            if (pct > 66) color = C_GREEN;
-            else if (pct > 33) color = C_YELLOW;
-            printf "  %-15s |%s%s%s\n", format_bin_name(bins[i]), color, bar, C_RESET;
-        }
+        # Right bar: by count
+        if (counts[i] > 0 && max_c > 0) {
+            br = int((counts[i] / max_c) * bw + 0.5);
+            if (br < 1) br = 1;
+            pct = (counts[i] / max_c) * 100;
+            cor = C_RED;
+            if (pct > 66) cor = C_GREEN;
+            else if (pct > 33) cor = C_YELLOW;
+        } else { br = 0; cor = ""; }
+        rbar = ""; for (b = 0; b < br; b++) rbar = rbar bar_char;
+
+        if (bl > 0 || br > 0)
+            printf "  %-15s |%s%s%s%s |%s%s%s\n", \
+                format_bin_name(bins[i]), col, lbar, C_RESET, lpad, cor, rbar, C_RESET;
+        else
+            printf "  %-15s |%*s |%s\n", format_bin_name(bins[i]), bw, "", "";
     }
+    # Overflow bin
     if (large_count > 0) {
-        bar_len = (max_c > 0) ? (large_count / max_c) * 50 : 0;
-        if (bar_len < 1) bar_len = 1;
-        bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-        pct = (max_c > 0) ? (large_count / max_c) * 100 : 0;
-        color = C_RED;
-        if (pct > 66) color = C_GREEN;
-        else if (pct > 33) color = C_YELLOW;
-        printf "  %-15s |%s%s%s\n\n", "> " hr(bins[num_bins-1]), color, bar, C_RESET;
-    } else { print "" }
+        bl = (max_s > 0) ? int((large_size / max_s) * bw + 0.5) : 0;
+        if (bl < 1) bl = 1;
+        lbar = ""; for (b = 0; b < bl; b++) lbar = lbar bar_char;
+        lpad = ""; for (b = bl; b < bw; b++) lpad = lpad " ";
+
+        br = (max_c > 0) ? int((large_count / max_c) * bw + 0.5) : 0;
+        if (br < 1) br = 1;
+        rbar = ""; for (b = 0; b < br; b++) rbar = rbar bar_char;
+        pct_c = (max_c > 0) ? (large_count / max_c) * 100 : 0;
+        cor = C_RED;
+        if (pct_c > 66) cor = C_GREEN;
+        else if (pct_c > 33) cor = C_YELLOW;
+
+        printf "  %-15s |%s%s%s%s |%s%s%s\n", \
+            "> " hr(bins[num_bins-1]), C_GREEN, lbar, C_RESET, lpad, cor, rbar, C_RESET;
+    }
+    print "";
 
     # ===========================================================
     # --- 2. Compute all three percentiles ---
@@ -300,10 +309,10 @@ END {
     # --- 3. Merged Table ---
     # ===========================================================
 
-    print "\nZFS Recordsize Analysis";
+    print "\nData Table";
     print DSEP;
     printf "  %-15s %10s %8s %12s %8s %9s\n", \
-        "Size Range", "Files", "% Files", "Total Size", "% Space", "Cumul. %";
+        "Size Range", "Files", "% Files", "Total Size", "% Space", "% Cumul.";
     print "  " IDSEP;
 
     for (i = 0; i < num_bins; i++) {
