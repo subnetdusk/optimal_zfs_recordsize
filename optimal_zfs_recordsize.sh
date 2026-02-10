@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# A script to generate a file size histogram and provide an intelligent ZFS recordsize recommendation.
+# optimal_zfs_recordsize.sh v2
+# Analyzes file size distribution and provides ZFS recordsize recommendations
+# for all workload types (read-heavy, write-heavy, balanced).
 
 # --- Script Setup and Validation ---
 set -e
 set -o pipefail
 
-# Check for gawk
 command -v gawk >/dev/null 2>&1 || {
     echo "Error: 'gawk' (GNU Awk) is required but not found. Please install it." >&2
     exit 1
@@ -27,11 +28,8 @@ fi
 echo "Analyzing files in: $TARGET_DIR"
 echo ""
 
-# Estimate maximum possible number of files by reading no of inodes
-# on underlying datastore which is hyper-conservative so we will tell user.
-# If the filesystem has dynamic inode allocation (i.e. Btrfs)
-# than falls back on a pre-scan with find | wc -l 
-
+# Estimate max files via inode count.
+# Falls back to find | wc -l on filesystems where df reports iused=0 (Btrfs).
 TOTAL_ESTIMATE=$(/usr/bin/df --output=iused "$TARGET_DIR" 2>/dev/null | tail -1)
 
 if (( TOTAL_ESTIMATE <= 0 )) 2>/dev/null; then
@@ -39,74 +37,52 @@ if (( TOTAL_ESTIMATE <= 0 )) 2>/dev/null; then
     TOTAL_ESTIMATE=$(find "$TARGET_DIR" -type f | wc -l)
 fi
 
-# --- Main Logic via find and gawk ---
-# The AWK script is passed as a command-line argument.
-(
-    FILE_COUNT=0
-    BAR_WIDTH=48
-    UPDATE_EVERY=727 # Increase this prime number if dealing with huge numbers of files
+printf "Assume analyzing entire dataset of %d inodes.\n" "$TOTAL_ESTIMATE" >&2
+printf "(If analyzing a subdir of ZFS dataset, estimate will be conservative!)\n\n" >&2
 
-    printf "Assume analyzing entire dataset of %d inodes.\n" "$TOTAL_ESTIMATE" >&2
-    printf "(If analyzing a subdir of dataset, estimate will be conservative!)\n\n" >&2
+# --- Main Logic: find pipes directly to gawk (no bash loop) ---
+/usr/bin/find -O3 "$TARGET_DIR" -type f -printf "%s\n" | /usr/bin/gawk -v total_est="$TOTAL_ESTIMATE" '
 
-    /usr/bin/find -O3 "$TARGET_DIR" -type f -printf "%s\n" | while read -r size; do
-        FILE_COUNT=$((FILE_COUNT + 1))
-        if (( FILE_COUNT % UPDATE_EVERY == 0 )); then
-            PERCENT=$(( FILE_COUNT * 100 / TOTAL_ESTIMATE ))
-
-            # Update progress only occasionally
-            FILLED=$(( PERCENT * BAR_WIDTH / 100 ))
-            EMPTY=$(( BAR_WIDTH - FILLED ))
-
-            printf "\r|%-*s%*s|%3d%% Processed: %d   " \
-                "$FILLED" "$(printf '%*s' "$FILLED" | sed 's/ /█/g')" \
-                "$EMPTY" "" \
-                "$PERCENT" \
-                "$FILE_COUNT" >&2
-        fi
-    echo "$size"
-    done
-
-    PERCENT=100
-    FILLED=$BAR_WIDTH
-    EMPTY=0
-   
-    printf "\r|%-*s%*s|%3d%% DONE!               " \
-        "$FILLED" "$(printf '%*s' "$FILLED" | sed 's/ /█/g')" \
-        "$EMPTY" "" \
-        "$PERCENT" >&2
-
-
-) | /usr/bin/gawk '
-
-# --- AWK BEGIN Block: Initialization ---
 BEGIN {
-    # Define the file size bins (powers of 2)
-    bins[0] = 512;       # 512 B
-    bins[1] = 1024;      # 1 KiB
-    bins[2] = 2048;      # 2 KiB
-    bins[3] = 4096;      # 4 KiB
-    bins[4] = 8192;      # 8 KiB
-    bins[5] = 16384;     # 16 KiB
-    bins[6] = 32768;     # 32 KiB
-    bins[7] = 65536;     # 64 KiB
-    bins[8] = 131072;    # 128 KiB (ZFS Default Recordsize)
-    bins[9] = 262144;    # 256 KiB
-    bins[10] = 524288;   # 512 KiB
-    bins[11] = 1048576;  # 1 MiB
-    bins[12] = 4194304;  # 4 MiB
-    bins[13] = 8388608;  # 8 MiB
-    bins[14] = 16777216; # 16 MiB
+    bins[0]  = 512;
+    bins[1]  = 1024;
+    bins[2]  = 2048;
+    bins[3]  = 4096;
+    bins[4]  = 8192;
+    bins[5]  = 16384;
+    bins[6]  = 32768;
+    bins[7]  = 65536;
+    bins[8]  = 131072;
+    bins[9]  = 262144;
+    bins[10] = 524288;
+    bins[11] = 1048576;
+    bins[12] = 2097152;
+    bins[13] = 4194304;
+    bins[14] = 8388608;
+    bins[15] = 16777216;
+    bins[16] = 33554432;
+    bins[17] = 67108864;
+    bins[18] = 134217728;
+    bins[19] = 268435456;
+    bins[20] = 536870912;
+    bins[21] = 1073741824;
 
-    num_bins = 15; # Total number of bins from index 0 to 14
+    num_bins = 22;
 
-    # ANSI color codes for the gradient
-    C_GREEN = "\033[32m";
+    C_GREEN  = "\033[32m";
     C_YELLOW = "\033[33m";
-    C_RED = "\033[31m";
-    C_RESET = "\033[0m";
+    C_BRYELLOW = "\033[93m";
+    C_RED    = "\033[31m";
+    C_BOLD   = "\033[1m";
+    C_RESET  = "\033[0m";
 
-    # Initialize arrays
+    DSEP  = "-----------------------------------------------------------------------------------------------";
+    IDSEP = "---------------------------------------------------------------------------------------------";
+
+    bar_width = 48;
+    update_every = 727;
+    bar_block = "\342\226\210";
+
     for (i = 0; i < num_bins; i++) {
         counts[i] = 0;
         total_size[i] = 0;
@@ -117,7 +93,6 @@ BEGIN {
     total_bytes = 0;
 }
 
-# --- AWK Functions ---
 function hr(bytes,    suffix, tier) {
     if (bytes == 0) return "0 B";
     split("B KiB MiB GiB TiB PiB", suffix, " ");
@@ -133,11 +108,53 @@ function format_bin_name(bin_value) {
     return "<= " hr(bin_value);
 }
 
-# --- AWK Main Block: Process each file size from find ---
+function to_zfs_recordsize(bytes) {
+    if (bytes <= 4096)   return "4k";
+    if (bytes <= 8192)   return "8k";
+    if (bytes <= 16384)  return "16k";
+    if (bytes <= 32768)  return "32k";
+    if (bytes <= 65536)  return "64k";
+    if (bytes <= 131072) return "128k";
+    if (bytes <= 262144) return "256k";
+    if (bytes <= 524288) return "512k";
+    return "1M";
+}
+
+# Find the bin index where cumulative space >= threshold
+function find_percentile(thresh,    cum, i) {
+    cum = 0;
+    for (i = 0; i < num_bins; i++) {
+        cum += total_size[i];
+        if (total_bytes > 0 && (cum / total_bytes) >= thresh) {
+            return i;
+        }
+    }
+    return num_bins; # overflow
+}
+
+function rec_from_bin(bin_idx) {
+    if (bin_idx >= num_bins) return "1M";
+    if (bins[bin_idx] < 4096) return "4k";
+    return to_zfs_recordsize(bins[bin_idx]);
+}
+
 {
     size = $1;
     total_files++;
     total_bytes += size;
+
+    # Progress bar (every N files, print to stderr)
+    if (total_files % update_every == 0 && total_est > 0) {
+        pct = int(total_files * 100 / total_est);
+        if (pct > 100) pct = 100;
+        filled = int(pct * bar_width / 100);
+        empty = bar_width - filled;
+        bar = "";
+        for (b = 0; b < filled; b++) bar = bar bar_block;
+        printf "\r|%-*s%*s|%3d%% Processed: %d   ", \
+            filled, bar, empty, "", pct, total_files > "/dev/stderr";
+        fflush("/dev/stderr");
+    }
 
     matched = 0;
     for (i = 0; i < num_bins; i++) {
@@ -154,38 +171,21 @@ function format_bin_name(bin_value) {
     }
 }
 
-# --- AWK END Block: Print reports and recommendation ---
 END {
     if (total_files == 0) {
         print "No files found in the specified directory.";
         exit;
     }
 
-    # Final progress output here to avoid subshell isolation to get total
-    printf "\n\nProcessed %s files! Generating report...\n\n", total_files;
+    # Final progress bar: 100% DONE
+    bar = "";
+    for (b = 0; b < bar_width; b++) bar = bar bar_block;
+    printf "\r|%s|100%% DONE!               \n", bar > "/dev/stderr";
+    fflush("/dev/stderr");
 
-    # --- 1. Detailed Statistics Table ---
-    print "=======================================================";
-    print "              File Size Distribution";
-    print "=======================================================";
-    printf "%-15s %15s %15s\n", "Size Range", "File Count", "Total Size";
-    print "-------------------------------------------------------";
+    printf "\nProcessed %s files! Generating report...\n", total_files;
 
-    for (i = 0; i < num_bins; i++) {
-        if (counts[i] > 0) {
-            printf "%-15s %15d %15s\n", format_bin_name(bins[i]), counts[i], hr(total_size[i]);
-        }
-    }
-
-    if (large_count > 0) {
-        printf "%-15s %15d %15s\n", "> " hr(bins[num_bins-1]), large_count, hr(large_size);
-    }
-
-    print "-------------------------------------------------------";
-    printf "%-15s %15d %15s\n", "TOTAL", total_files, hr(total_bytes);
-    print "=======================================================\n";
-
-    # --- 2. Visual Histograms ---
+    # --- 1. Side-by-side Visual Histograms ---
     max_s = large_size;
     max_c = large_count;
     for (i = 0; i < num_bins; i++) {
@@ -193,109 +193,223 @@ END {
         if (counts[i] > max_c) max_c = counts[i];
     }
 
-    bar_char = "█";
+    bar_char = bar_block;
+    bw = 35; # bar width per side
 
-    print "Visual Histogram (by total size in each bin)";
-    print "-------------------------------------------------------";
+    printf "\nHistograms\n";
+    print DSEP;
+    printf "  %-15s  %-35s  %s\n", "", "by total size", "by file count";
+    print DSEP;
     for (i = 0; i < num_bins; i++) {
-        bar_len = (max_s > 0) ? (total_size[i] / max_s) * 50 : 0;
-        if (total_size[i] > 0 && bar_len < 1) bar_len = 1;
-        bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-        
-        percentage = (max_s > 0) ? (total_size[i] / max_s) * 100 : 0;
-        color = C_RED;
-        if (percentage > 66) color = C_GREEN;
-        else if (percentage > 33) color = C_YELLOW;
-        
-        printf "%-15s |%s%s%s\n", format_bin_name(bins[i]), color, bar, C_RESET;
+        # Left bar: by size
+        if (counts[i] > 0 && max_s > 0) {
+            bl = int((total_size[i] / max_s) * bw + 0.5);
+            if (bl < 1) bl = 1;
+            pct = (total_size[i] / max_s) * 100;
+            col = C_RED;
+            if (pct > 66) col = C_GREEN;
+            else if (pct > 33) col = C_YELLOW;
+        } else { bl = 0; col = ""; }
+        lbar = ""; for (b = 0; b < bl; b++) lbar = lbar bar_char;
+        lpad = ""; for (b = bl; b < bw; b++) lpad = lpad " ";
+
+        # Right bar: by count
+        if (counts[i] > 0 && max_c > 0) {
+            br = int((counts[i] / max_c) * bw + 0.5);
+            if (br < 1) br = 1;
+            pct = (counts[i] / max_c) * 100;
+            cor = C_RED;
+            if (pct > 66) cor = C_GREEN;
+            else if (pct > 33) cor = C_YELLOW;
+        } else { br = 0; cor = ""; }
+        rbar = ""; for (b = 0; b < br; b++) rbar = rbar bar_char;
+
+        if (bl > 0 || br > 0)
+            printf "  %-15s |%s%s%s%s |%s%s%s\n", \
+                format_bin_name(bins[i]), col, lbar, C_RESET, lpad, cor, rbar, C_RESET;
+        else
+            printf "  %-15s |%*s |%s\n", format_bin_name(bins[i]), bw, "", "";
     }
-    if (large_size > 0) {
-        bar_len = (max_s > 0) ? (large_size / max_s) * 50 : 0;
-        if (large_size > 0 && bar_len < 1) bar_len = 1;
-        bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-        printf "%-15s |%s%s%s\n\n", "> " hr(bins[num_bins-1]), C_GREEN, bar, C_RESET; # Largest is always green
-    } else { print "" }
-
-
-    print "Visual Histogram (by number of files in each bin)";
-    print "-------------------------------------------------------";
-    for (i = 0; i < num_bins; i++) {
-        bar_len = (max_c > 0) ? (counts[i] / max_c) * 50 : 0;
-        if (counts[i] > 0 && bar_len < 1) bar_len = 1;
-        bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
-
-        percentage = (max_c > 0) ? (counts[i] / max_c) * 100 : 0;
-        color = C_RED;
-        if (percentage > 66) color = C_GREEN;
-        else if (percentage > 33) color = C_YELLOW;
-
-        printf "%-15s |%s%s%s\n", format_bin_name(bins[i]), color, bar, C_RESET;
-    }
+    # Overflow bin
     if (large_count > 0) {
-        bar_len = (max_c > 0) ? (large_count / max_c) * 50 : 0;
-        if (large_count > 0 && bar_len < 1) bar_len = 1;
-        bar = sprintf("%*s", int(bar_len + 0.5), ""); gsub(/ /, bar_char, bar);
+        bl = (max_s > 0) ? int((large_size / max_s) * bw + 0.5) : 0;
+        if (bl < 1) bl = 1;
+        lbar = ""; for (b = 0; b < bl; b++) lbar = lbar bar_char;
+        lpad = ""; for (b = bl; b < bw; b++) lpad = lpad " ";
 
-        percentage = (max_c > 0) ? (large_count / max_c) * 100 : 0;
-        color = C_RED;
-        if (percentage > 66) color = C_GREEN;
-        else if (percentage > 33) color = C_YELLOW;
+        br = (max_c > 0) ? int((large_count / max_c) * bw + 0.5) : 0;
+        if (br < 1) br = 1;
+        rbar = ""; for (b = 0; b < br; b++) rbar = rbar bar_char;
+        pct_c = (max_c > 0) ? (large_count / max_c) * 100 : 0;
+        cor = C_RED;
+        if (pct_c > 66) cor = C_GREEN;
+        else if (pct_c > 33) cor = C_YELLOW;
 
-        printf "%-15s |%s%s%s\n\n", "> " hr(bins[num_bins-1]), color, bar, C_RESET;
-    } else { print "" }
+        printf "  %-15s |%s%s%s%s |%s%s%s\n", \
+            "> " hr(bins[num_bins-1]), C_GREEN, lbar, C_RESET, lpad, cor, rbar, C_RESET;
+    }
+    print "";
 
-    # --- 3. Intelligent Recordsize Recommendation ---
-    print "=======================================================";
-    print "            ZFS Recordsize Recommendation";
-    print "=======================================================";
+    # ===========================================================
+    # --- 2. Compute all three percentiles ---
+    # ===========================================================
 
-    max_data_in_bin = 0;
-    suggested_bin_index = -1;
+    p50_bin = find_percentile(0.50);
+    p70_bin = find_percentile(0.70);
+    p90_bin = find_percentile(0.90);
+
+    rec_write = rec_from_bin(p50_bin);
+    rec_mixed = rec_from_bin(p70_bin);
+    rec_read  = rec_from_bin(p90_bin);
+
+    # Precompute CDF for table
+    cumulative = 0;
     for (i = 0; i < num_bins; i++) {
-        if (total_size[i] > max_data_in_bin) {
-            max_data_in_bin = total_size[i];
-            suggested_bin_index = i;
-        }
+        cumulative += total_size[i];
+        cum_pct[i] = (total_bytes > 0) ? (cumulative / total_bytes) * 100 : 0;
     }
-    if (large_size > max_data_in_bin) {
-        suggested_bin_index = num_bins; # Special index for "large"
-    }
+    cumulative += large_size;
+    cum_pct_large = (total_bytes > 0) ? (cumulative / total_bytes) * 100 : 0;
 
+    # --- Skewness detection ---
+    # A heavily right-skewed distribution has most files concentrated
+    # in small sizes (by count) while most space is in the right tail
+    # (large files). The two metrics point to opposite recordsizes.
     small_file_count = 0;
-    for (i = 0; i <= 7; i++) { # Sum counts for all bins <= 64 KiB
+    small_file_size = 0;
+    for (i = 0; i <= 7; i++) {
         small_file_count += counts[i];
+        small_file_size += total_size[i];
     }
-    small_file_count_percentage = (total_files > 0) ? (small_file_count / total_files) * 100 : 0;
+    small_pct_count = (total_files > 0) ? (small_file_count / total_files) * 100 : 0;
 
-    if (suggested_bin_index >= 11) {
-        if (small_file_count_percentage > 40 && small_file_count > 5000) {
-            print "  This is a MIXED WORKLOAD. The data volume is in large files,";
-            print "  but there is also a very high number of small files.";
-            printf("  (%.0f%% of files, numbering over %d, are 64 KiB or smaller).\n\n", small_file_count_percentage, small_file_count);
-            print "  RECOMMENDATION: Use the default 128k recordsize.";
-            print "  This provides the best balance, protecting the performance of tens of";
-            print "  thousands of small files from read-modify-write penalties.";
-            print "\n  > zfs set recordsize=128k <pool>/<dataset>";
+    big_file_size = 0;
+    big_file_count = 0;
+    for (i = 12; i < num_bins; i++) {
+        big_file_size += total_size[i];
+        big_file_count += counts[i];
+    }
+    big_file_size += large_size;
+    big_file_count += large_count;
+    big_pct_space = (total_bytes > 0) ? (big_file_size / total_bytes) * 100 : 0;
 
-        } else {
-            print "  This is a LARGE FILE WORKLOAD. The data is dominated by large, sequential files.";
-            print "  While some small metadata files may exist, their number is not significant";
-            print "  enough to compromise on optimizing for the vast majority of the data.\n";
-            print "  RECOMMENDATION: Use a 1M recordsize.";
-            print "  This reduces metadata overhead and provides peak performance for sequential I/O.";
-            print "\n  > zfs set recordsize=1M <pool>/<dataset>";
+    is_skewed = 0;
+    if (small_pct_count > 60 && big_pct_space > 80) {
+        is_skewed = 1;
+    }
+
+    # --- Skewed overrides for write and mixed ---
+    if (is_skewed) {
+        rec_write = "128k";
+        rec_mixed = "256k";
+        # rec_read stays as-is (no RMW penalty on reads)
+    }
+
+    # ===========================================================
+    # --- 3. Merged Table ---
+    # ===========================================================
+
+    print "\nData Table";
+    print DSEP;
+    printf "  %-15s %10s %8s %12s %8s %9s\n", \
+        "Size Range", "Files", "% Files", "Total Size", "% Space", "% Cumul.";
+    print "  " IDSEP;
+
+    for (i = 0; i < num_bins; i++) {
+        if (counts[i] > 0) {
+            pct_count = (total_files > 0) ? (counts[i] / total_files) * 100 : 0;
+            pct_space = (total_bytes > 0) ? (total_size[i] / total_bytes) * 100 : 0;
+
+            cum_color = C_RED;
+            if (cum_pct[i] >= 70) cum_color = C_GREEN;
+            else if (cum_pct[i] >= 50) cum_color = C_YELLOW;
+
+            printf "  %-15s %10d %7.1f%% %12s %7.1f%% %s%8.1f%%%s\n", \
+                format_bin_name(bins[i]), counts[i], pct_count, \
+                hr(total_size[i]), pct_space, cum_color, cum_pct[i], C_RESET;
         }
     }
-    else {
-        suggested_size_bytes = bins[suggested_bin_index];
-        print "  This is a SMALL/MEDIUM FILE WORKLOAD. ";
-        print "  Your data distribution is dominated by files in the " hr(suggested_size_bytes) " range.\n";
-        print "  RECOMMENDATION: Match the recordsize to this dominant file size.";
-        print "  This provides a good balance of performance and storage efficiency for";
-        print "  your specific workload.";
-        printf("\n  > zfs set recordsize=%dk <pool>/<dataset>\n", suggested_size_bytes / 1024);
+
+    if (large_count > 0) {
+        pct_count = (total_files > 0) ? (large_count / total_files) * 100 : 0;
+        pct_space = (total_bytes > 0) ? (large_size / total_bytes) * 100 : 0;
+
+        cum_color = C_RED;
+        if (cum_pct_large >= 70) cum_color = C_GREEN;
+        else if (cum_pct_large >= 50) cum_color = C_YELLOW;
+
+        printf "  %-15s %10d %7.1f%% %12s %7.1f%% %s%8.1f%%%s\n", \
+            "> " hr(bins[num_bins-1]), large_count, pct_count, \
+            hr(large_size), pct_space, cum_color, cum_pct_large, C_RESET;
     }
-    print "=======================================================";
-    print "NOTE: This is a suggestion. Always benchmark your specific workload.";
+
+    print "  " IDSEP;
+    printf "  %-15s %10d          %12s\n", "TOTAL", total_files, hr(total_bytes);
+
+    # ===========================================================
+    # --- 4. Recommendations ---
+    # ===========================================================
+
+    printf "\n%sRecommendations%s\n", C_BOLD, C_RESET;
+    print DSEP;
+
+    if (rec_read == rec_write && rec_write == rec_mixed) {
+        printf "  %sAll sequential workloads agree:  recordsize=%s%s\n\n", C_BOLD, rec_read, C_RESET;
+        print  "  Read-heavy, mixed, and sequential write workloads all point to the same value.";
+        printf "\n  > zfs set recordsize=%s <pool>/<dataset>\n", rec_read;
+
+    } else {
+        printf "  %sRead-heavy:              recordsize=%-5s%s  (space P90: optimize for data volume)\n", \
+            C_BOLD, rec_read, C_RESET;
+        print  "    Media libraries, backups, archives, static data.";
+        print  "    Small files use variable-size blocks, no penalty on reads.\n";
+        printf "  %sMixed / Unknown:         recordsize=%-5s%s  (space P70: balanced)\n", \
+            C_BOLD, rec_mixed, C_RESET;
+        print  "    Mixed or uncertain workload. Middle ground.\n";
+        printf "  %sWrite-heavy (seq.):      recordsize=%-5s%s  (space P50: whole-file writes)\n", \
+            C_BOLD, rec_write, C_RESET;
+        print  "    Downloads, rendering, compilation, log rotation.";
+        print  "    I/O size matches file size, protect against RMW on bulk data.";
+    }
+
+    printf "\n  %sWrite-heavy (random I/O):%s  match your application block size\n", C_BOLD, C_RESET;
+    print  "    When I/O is much smaller than file size, recordsize must match the";
+    print  "    application block size, not the file size. Suggested values:\n";
+    print  "      PostgreSQL ......... 8k       MySQL/InnoDB ........ 16k";
+    print  "      SQLite ............. 4k       MongoDB (WiredTiger). 4k";
+    print  "      VM disk images ..... 4k-16k   BitTorrent .......... 16k";
+    print  "      Elasticsearch ...... 4k       Redis (AOF) ......... 4k";
+
+    # --- Skewed distribution warning ---
+    if (is_skewed) {
+        printf "\n%s\n%s%sHeavily Skewed Distribution%s\n", C_RESET, C_BRYELLOW, C_BOLD, C_RESET;
+        printf "%s", C_BRYELLOW;
+        print  DSEP;
+        printf "  File count is concentrated in small files (%.0f%% of files are <= 64 KiB)\n", small_pct_count;
+        printf "  while data volume is concentrated in large files (%.0f%% of space is in files > 1 MiB).\n", big_pct_space;
+        print  "  The two metrics point to opposite recordsizes, so a single value is always";
+        print  "  a compromise. The write-heavy and mixed recommendations have been adjusted";
+        print  "  downward to protect small-file write performance.";
+
+        # Compute small-file mode for split suggestion
+        small_mode_count = 0;
+        small_mode_bin = 0;
+        for (i = 0; i <= 7; i++) {
+            if (counts[i] > small_mode_count) {
+                small_mode_count = counts[i];
+                small_mode_bin = i;
+            }
+        }
+        small_rec = to_zfs_recordsize(bins[small_mode_bin]);
+
+        print  "";
+        print  "  If possible, split into separate ZFS datasets:";
+        print  "";
+        printf "    > zfs create -o recordsize=1M    pool/data/large_files\n";
+        printf "    > zfs create -o recordsize=%-5s pool/data/small_files\n", small_rec;
+    }
+
+    printf "\n%s%s\n", C_RESET, DSEP;
+    print "NOTE: These are suggestions based on file size distribution.\n      Always benchmark your specific workload.";
 }
 '
