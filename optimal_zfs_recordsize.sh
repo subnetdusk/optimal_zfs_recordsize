@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# optimal_zfs_recordsize.sh v2
+# optimal_zfs_recordsize.sh v1.1
 # Analyzes file size distribution and provides ZFS recordsize recommendations
 # for all workload types (read-heavy, write-heavy, balanced).
 
